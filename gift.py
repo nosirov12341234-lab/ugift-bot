@@ -1,17 +1,20 @@
 """
-U-Gift Bot — To'liq professional bot
-Fragment API dan narxlar avtomatik olinadi
-Narxlar buyurtma vaqtida qotib qoladi (price lock)
-TON → UZS avtomatik konvertatsiya
+U-Gift Bot - To'liq professional bot
+- Fragment.com dan haqiqiy narxlar olinadi (web scraping)
+- CoinGecko + CBU dan kurs olinadi
+- Price Lock tizimi (narx qotib qoladi)
+- Premium, Stars, Gifts, NFT
+- Admin panel to'liq
 """
 
 import asyncio
 import logging
 import json
 import os
+import re
 import time
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -25,56 +28,54 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # SOZLAMALAR
-# ═══════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN")
-SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-TON_API_KEY    = os.getenv("TON_API_KEY", "")
+# ═══════════════════════════════════════
+BOT_TOKEN        = os.getenv("BOT_TOKEN")
+SUPER_ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
+TON_API_KEY      = os.getenv("TON_API_KEY", "")
 FRAGMENT_COOKIES = os.getenv("FRAGMENT_COOKIES", "")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-# ═══════════════════════════════════════════
-# NARX TIZIMI (PRICE ENGINE)
-# ═══════════════════════════════════════════
-# Narxlar keshi — har 30 daqiqada yangilanadi
-PRICE_CACHE = {
-    "ton_usd"    : 0.0,
-    "usd_uzs"    : 0.0,
-    "ton_uzs"    : 0.0,
-    "stars_ton"  : 0.0,   # 1 Star = ? TON
-    "premium"    : {       # Premium narxlari TON da
+# ═══════════════════════════════════════
+# NARX TIZIMI
+# Fragment.com dan haqiqiy narxlar
+# ═══════════════════════════════════════
+PRICES = {
+    "ton_usd"    : 0.0,   # 1 TON = ? USD
+    "usd_uzs"    : 0.0,   # 1 USD = ? UZS
+    "ton_uzs"    : 0.0,   # 1 TON = ? UZS (hisoblangan)
+    "premium"    : {      # Fragment dan olingan narxlar (TON)
         3 : 0.0,
         6 : 0.0,
         12: 0.0,
     },
+    "stars_rate" : 0.0,   # 1 Star = ? TON (Fragment dan)
     "last_update": 0,
     "updating"   : False,
 }
 
 CACHE_TTL = 30 * 60  # 30 daqiqa
 
-async def fetch_ton_rate() -> tuple[float, float]:
-    """1 TON = ? USD va 1 USD = ? UZS"""
+async def fetch_kurs() -> tuple:
+    """CoinGecko + CBU dan kurs olish"""
     async with aiohttp.ClientSession() as s:
-        # TON/USD — CoinGecko
+        # TON/USD
         async with s.get(
             "https://api.coingecko.com/api/v3/simple/price"
             "?ids=the-open-network&vs_currencies=usd",
-            timeout=aiohttp.ClientTimeout(total=8)
+            timeout=aiohttp.ClientTimeout(total=8),
+            headers={"User-Agent": "Mozilla/5.0"}
         ) as r:
             d = await r.json()
             ton_usd = float(d["the-open-network"]["usd"])
 
-        # USD/UZS — O'zbekiston Markaziy Banki
+        # USD/UZS — Markaziy Bank
         async with s.get(
             "https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/",
             timeout=aiohttp.ClientTimeout(total=8)
@@ -84,137 +85,198 @@ async def fetch_ton_rate() -> tuple[float, float]:
 
     return ton_usd, usd_uzs
 
-async def fetch_fragment_prices() -> dict:
-    """Fragment API dan haqiqiy narxlarni olish"""
-    prices = {"stars_ton": 0.0, "premium": {3: 0.0, 6: 0.0, 12: 0.0}}
+async def fetch_fragment_premium_prices() -> dict:
+    """Fragment.com dan Premium narxlarini scraping qilish"""
+    prices = {3: 0.0, 6: 0.0, 12: 0.0}
     try:
-        from FragmentAPI import SyncFragmentAPI
-        api = SyncFragmentAPI(
-            cookies=FRAGMENT_COOKIES,
-            wallet_api_key=TON_API_KEY
-        )
-        # Stars narxi
-        try:
-            stars_info = api.get_stars_price(50)
-            if stars_info and hasattr(stars_info, 'ton'):
-                prices["stars_ton"] = float(stars_info.ton) / 50  # 1 Star = ? TON
-                log.info(f"Stars narxi: 50 Stars = {stars_info.ton} TON")
-        except Exception as e:
-            log.warning(f"Stars narxi olinmadi: {e}")
-            prices["stars_ton"] = 0.01  # fallback: 1 Star ≈ 0.01 TON
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if FRAGMENT_COOKIES:
+            headers["Cookie"] = FRAGMENT_COOKIES
 
-        # Premium narxlari
-        for months in [3, 6, 12]:
-            try:
-                prem_info = api.get_premium_price(months)
-                if prem_info and hasattr(prem_info, 'ton'):
-                    prices["premium"][months] = float(prem_info.ton)
-                    log.info(f"Premium {months}oy: {prem_info.ton} TON")
-            except Exception as e:
-                log.warning(f"Premium {months}oy narxi olinmadi: {e}")
-                # Fallback narxlar
-                fallback = {3: 3.75, 6: 7.50, 12: 15.00}
-                prices["premium"][months] = fallback[months]
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://fragment.com/premium",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                html = await r.text()
+
+        # Fragment saytidan TON narxlarni qidirish
+        # Masalan: "22.67" yoki "12.50" yoki "9.37"
+        # Fragment sahifasida JSON format: {"months":3,"price":"9.37"}
+        import re
+
+        # JSON data qidirish
+        pattern = r'"months"\s*:\s*(\d+)\s*,\s*"price"\s*:\s*"?([\d.]+)"?'
+        matches = re.findall(pattern, html)
+
+        if matches:
+            for months_str, price_str in matches:
+                months = int(months_str)
+                price  = float(price_str)
+                if months in prices:
+                    prices[months] = price
+                    log.info(f"Fragment Premium {months}oy = {price} TON")
+
+        # Agar topilmasa — Fragment API orqali urinish
+        if all(v == 0 for v in prices.values()):
+            # Fallback: Fragment API
+            pattern2 = r'([\d.]+)\s*TON[^<]*?(\d+)\s*month'
+            matches2 = re.findall(pattern2, html, re.IGNORECASE)
+            for price_str, months_str in matches2:
+                months = int(months_str)
+                price  = float(price_str)
+                if months in prices and price > 0:
+                    prices[months] = price
 
     except Exception as e:
-        log.error(f"Fragment API narx xatosi: {e}")
-        # Fallback
-        prices["stars_ton"] = 0.01
-        prices["premium"] = {3: 3.75, 6: 7.50, 12: 15.00}
+        log.error(f"Fragment Premium scraping xatosi: {e}")
+
+    # Agar hali ham 0 bo'lsa — hozirgi Fragment narxlarini ishlatamiz
+    if prices[3] == 0:
+        prices = {3: 9.37, 6: 12.50, 12: 22.67}
+        log.warning("Fragment scraping ishlamadi, hozirgi narxlar ishlatildi")
 
     return prices
 
-async def update_prices(force: bool = False):
-    """Narxlarni yangilash"""
-    now = time.time()
-    if PRICE_CACHE["updating"]:
-        return
-    if not force and now - PRICE_CACHE["last_update"] < CACHE_TTL:
-        return
-    if PRICE_CACHE["ton_uzs"] > 0 and not force and now - PRICE_CACHE["last_update"] < CACHE_TTL:
-        return
-
-    PRICE_CACHE["updating"] = True
+async def fetch_fragment_stars_rate() -> float:
+    """Fragment.com dan Stars narxini scraping"""
     try:
-        # TON kursi
-        ton_usd, usd_uzs = await fetch_ton_rate()
-        PRICE_CACHE["ton_usd"]  = ton_usd
-        PRICE_CACHE["usd_uzs"]  = usd_uzs
-        PRICE_CACHE["ton_uzs"]  = ton_usd * usd_uzs
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        if FRAGMENT_COOKIES:
+            headers["Cookie"] = FRAGMENT_COOKIES
 
-        # Fragment narxlari
-        frag = await fetch_fragment_prices()
-        PRICE_CACHE["stars_ton"]  = frag["stars_ton"]
-        PRICE_CACHE["premium"]    = frag["premium"]
-        PRICE_CACHE["last_update"] = now
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://fragment.com/stars",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                html = await r.text()
 
+        # Stars narxini qidirish
+        # Fragment: 50 Stars = X TON
+        pattern = r'50\s*(?:Stars?|stars?)[^<]*?([\d.]+)\s*TON'
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            ton_for_50 = float(match.group(1))
+            rate = ton_for_50 / 50  # 1 Star = ? TON
+            log.info(f"Fragment Stars: 50 Stars = {ton_for_50} TON → 1 Star = {rate:.5f} TON")
+            return rate
+
+        # Alternativ pattern
+        pattern2 = r'"amount"\s*:\s*50.*?"price"\s*:\s*"?([\d.]+)"?'
+        match2 = re.search(pattern2, html, re.DOTALL)
+        if match2:
+            ton_for_50 = float(match2.group(1))
+            rate = ton_for_50 / 50
+            log.info(f"Stars rate: {rate:.5f} TON/star")
+            return rate
+
+    except Exception as e:
+        log.error(f"Fragment Stars scraping xatosi: {e}")
+
+    # Fallback: Fragment da hozirgi narx ~0.466 TON/50 stars
+    log.warning("Stars scraping ishlamadi, hozirgi narx ishlatildi: 0.00932 TON/star")
+    return 0.00932  # 50 Stars ≈ 0.466 TON → 1 Star ≈ 0.00932 TON
+
+async def update_all_prices(force: bool = False):
+    """Barcha narxlarni yangilash"""
+    if PRICES["updating"]:
+        return
+    now = time.time()
+    if not force and now - PRICES["last_update"] < CACHE_TTL and PRICES["ton_uzs"] > 0:
+        return
+
+    PRICES["updating"] = True
+    try:
+        # 1. Kurs olish
+        ton_usd, usd_uzs = await fetch_kurs()
+        PRICES["ton_usd"] = ton_usd
+        PRICES["usd_uzs"] = usd_uzs
+        PRICES["ton_uzs"] = ton_usd * usd_uzs
+
+        # 2. Fragment Premium narxlari
+        prem = await fetch_fragment_premium_prices()
+        PRICES["premium"] = prem
+
+        # 3. Fragment Stars narxi
+        stars_rate = await fetch_fragment_stars_rate()
+        PRICES["stars_rate"] = stars_rate
+
+        PRICES["last_update"] = now
         log.info(
-            f"Narxlar yangilandi: "
-            f"1 TON = ${ton_usd:.2f} = {int(ton_usd * usd_uzs):,} UZS | "
-            f"1 Star = {frag['stars_ton']:.4f} TON"
+            f"✅ Narxlar yangilandi:\n"
+            f"   1 TON = ${ton_usd:.3f} = {int(ton_usd * usd_uzs):,} UZS\n"
+            f"   Premium: 3oy={prem[3]} | 6oy={prem[6]} | 12oy={prem[12]} TON\n"
+            f"   1 Star = {stars_rate:.5f} TON"
         )
     except Exception as e:
         log.error(f"Narx yangilashda xato: {e}")
-        if PRICE_CACHE["ton_uzs"] == 0:
-            PRICE_CACHE["ton_usd"]  = 3.5
-            PRICE_CACHE["usd_uzs"]  = 12800.0
-            PRICE_CACHE["ton_uzs"]  = 44800.0
-            PRICE_CACHE["stars_ton"] = 0.01
-            PRICE_CACHE["premium"]   = {3: 3.75, 6: 7.50, 12: 15.00}
+        # Fallback
+        if PRICES["ton_uzs"] == 0:
+            PRICES["ton_usd"]    = 3.5
+            PRICES["usd_uzs"]    = 12800.0
+            PRICES["ton_uzs"]    = 44800.0
+            PRICES["premium"]    = {3: 9.37, 6: 12.50, 12: 22.67}
+            PRICES["stars_rate"] = 0.00932
     finally:
-        PRICE_CACHE["updating"] = False
+        PRICES["updating"] = False
 
-def ton_to_uzs_now(ton: float) -> int:
-    """TON ni hozirgi kurs bilan UZS ga o'tkazadi (markup bilan)"""
-    d = db()
-    markup = d["settings"]["markup"]
-    rate   = PRICE_CACHE["ton_uzs"]
-    if rate == 0:
-        rate = 44800.0
-    return round(ton * rate * (1 + markup / 100))
-
-def get_stars_price_uzs(count: int) -> dict:
-    """Stars narxini hozirgi kurs bilan qaytaradi"""
-    stars_ton = PRICE_CACHE["stars_ton"]
-    if stars_ton == 0:
-        stars_ton = 0.01
-    ton   = count * stars_ton
-    uzs   = ton_to_uzs_now(ton)
-    return {
-        "count"    : count,
-        "ton"      : round(ton, 4),
-        "uzs"      : uzs,
-        "rate_ton" : stars_ton,
-        "rate_uzs" : PRICE_CACHE["ton_uzs"],
-        "locked_at": time.time(),
-    }
-
-def get_premium_price_uzs(months: int) -> dict:
-    """Premium narxini hozirgi kurs bilan qaytaradi"""
-    ton = PRICE_CACHE["premium"].get(months, 3.75)
-    if ton == 0:
-        ton = {3: 3.75, 6: 7.50, 12: 15.00}.get(months, 3.75)
-    uzs = ton_to_uzs_now(ton)
-    return {
-        "months"   : months,
-        "ton"      : ton,
-        "uzs"      : uzs,
-        "rate_uzs" : PRICE_CACHE["ton_uzs"],
-        "locked_at": time.time(),
-    }
-
-async def price_updater_loop():
+async def price_loop():
     """Har 30 daqiqada narxlarni yangilaydi"""
     while True:
         try:
-            await update_prices(force=True)
+            await update_all_prices(force=True)
         except Exception as e:
-            log.error(f"Price updater: {e}")
+            log.error(f"Price loop: {e}")
         await asyncio.sleep(CACHE_TTL)
 
-# ═══════════════════════════════════════════
+def calc_uzs(ton: float) -> int:
+    """TON → UZS (markup bilan)"""
+    d      = db()
+    markup = d["settings"]["markup"]
+    rate   = PRICES["ton_uzs"] or 44800.0
+    return round(ton * rate * (1 + markup / 100))
+
+def get_premium_info(months: int) -> dict:
+    """Premium narx ma'lumoti (qotirilgan)"""
+    ton = PRICES["premium"].get(months, 9.37)
+    if ton == 0:
+        ton = {3: 9.37, 6: 12.50, 12: 22.67}[months]
+    return {
+        "ton"      : ton,
+        "uzs"      : calc_uzs(ton),
+        "rate_uzs" : PRICES["ton_uzs"],
+        "locked_at": time.time(),
+    }
+
+def get_stars_info(count: int) -> dict:
+    """Stars narx ma'lumoti (qotirilgan)"""
+    rate = PRICES["stars_rate"] or 0.00932
+    ton  = count * rate
+    return {
+        "count"    : count,
+        "ton"      : round(ton, 4),
+        "uzs"      : calc_uzs(ton),
+        "rate_uzs" : PRICES["ton_uzs"],
+        "locked_at": time.time(),
+    }
+
+def fmt_ton(n: float) -> str:
+    s = f"{n:.4f}".rstrip("0").rstrip(".")
+    return s
+
+# ═══════════════════════════════════════
 # DATABASE
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 DB_FILE = "database.json"
 
 def db() -> dict:
@@ -224,16 +286,11 @@ def db() -> dict:
     return {
         "users": {}, "orders": [], "admins": {}, "promo_codes": {},
         "settings": {
-            "markup": 20,
-            "min_stars": 50,
-            "bot_active": True,
-            "referral_active": False,
-            "promo_active": False,
-            "referral_bonus": 5000,
-            "cards": [],
-            "required_channels": [],
-            "logs_channel": None,
-            "order_timeout_min": 15,
+            "markup": 20, "min_stars": 50, "bot_active": True,
+            "referral_active": False, "promo_active": False,
+            "referral_bonus": 5000, "cards": [],
+            "required_channels": [], "logs_channel": None,
+            "price_lock_min": 15,
         }
     }
 
@@ -260,72 +317,42 @@ def is_super(uid: int) -> bool:
 def fmt(n) -> str:
     return f"{int(n):,}".replace(",", " ")
 
-def fmt_ton(n: float) -> str:
-    return f"{n:.4f}".rstrip("0").rstrip(".")
-
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # TILLAR
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 L = {
     "uz": {
-        "welcome": (
-            "👋 <b>U-Gift Bot ga xush kelibsiz!</b>\n\n"
-            "✨ Telegram Premium, Stars, Gifts va NFT yuborish xizmati.\n\n"
-            "💡 Xizmat tanlang:"
-        ),
-        "premium": "⭐ Premium Gift",
-        "stars"  : "🌟 Stars",
-        "gifts"  : "🎁 Gifts",
-        "nft"    : "🖼 NFT",
-        "balance": "💰 Balans",
-        "history": "📋 Tarix",
-        "topup"  : "➕ Hisob to'ldirish",
-        "referral": "👥 Referral",
-        "promo"  : "🎁 Promo kod",
+        "welcome" : "👋 <b>U-Gift Bot ga xush kelibsiz!</b>\n\n✨ Telegram Premium, Stars, Gifts va NFT yuborish xizmati.\n\n💡 Xizmat tanlang:",
+        "premium" : "⭐ Premium Gift", "stars": "🌟 Stars",
+        "gifts"   : "🎁 Gifts",        "nft"  : "🖼 NFT",
+        "balance" : "💰 Balans",       "history": "📋 Tarix",
+        "topup"   : "➕ Hisob to'ldirish",
+        "referral": "👥 Referral",     "promo": "🎁 Promo kod",
         "settings": "⚙️ Sozlamalar",
-        "cancel" : "❌ Bekor",
-        "self"   : "👤 O'zimga",
-        "other"  : "👥 Boshqaga",
+        "cancel"  : "❌ Bekor",
+        "self"    : "👤 O'zimga",      "other": "👥 Boshqaga",
     },
     "ru": {
-        "welcome": (
-            "👋 <b>Добро пожаловать в U-Gift Bot!</b>\n\n"
-            "✨ Сервис отправки Telegram Premium, Stars, Gifts и NFT.\n\n"
-            "💡 Выберите услугу:"
-        ),
-        "premium": "⭐ Premium Gift",
-        "stars"  : "🌟 Stars",
-        "gifts"  : "🎁 Gifts",
-        "nft"    : "🖼 NFT",
-        "balance": "💰 Баланс",
-        "history": "📋 История",
-        "topup"  : "➕ Пополнить",
-        "referral": "👥 Реферал",
-        "promo"  : "🎁 Промо код",
+        "welcome" : "👋 <b>Добро пожаловать в U-Gift Bot!</b>\n\n✨ Отправка Telegram Premium, Stars, Gifts и NFT.\n\n💡 Выберите услугу:",
+        "premium" : "⭐ Premium Gift", "stars": "🌟 Stars",
+        "gifts"   : "🎁 Gifts",        "nft"  : "🖼 NFT",
+        "balance" : "💰 Баланс",       "history": "📋 История",
+        "topup"   : "➕ Пополнить",
+        "referral": "👥 Реферал",      "promo": "🎁 Промо код",
         "settings": "⚙️ Настройки",
-        "cancel" : "❌ Отмена",
-        "self"   : "👤 Себе",
-        "other"  : "👥 Другому",
+        "cancel"  : "❌ Отмена",
+        "self"    : "👤 Себе",         "other": "👥 Другому",
     },
     "en": {
-        "welcome": (
-            "👋 <b>Welcome to U-Gift Bot!</b>\n\n"
-            "✨ Telegram Premium, Stars, Gifts and NFT sending service.\n\n"
-            "💡 Choose a service:"
-        ),
-        "premium": "⭐ Premium Gift",
-        "stars"  : "🌟 Stars",
-        "gifts"  : "🎁 Gifts",
-        "nft"    : "🖼 NFT",
-        "balance": "💰 Balance",
-        "history": "📋 History",
-        "topup"  : "➕ Top up",
-        "referral": "👥 Referral",
-        "promo"  : "🎁 Promo code",
+        "welcome" : "👋 <b>Welcome to U-Gift Bot!</b>\n\n✨ Telegram Premium, Stars, Gifts and NFT sending service.\n\n💡 Choose a service:",
+        "premium" : "⭐ Premium Gift", "stars": "🌟 Stars",
+        "gifts"   : "🎁 Gifts",        "nft"  : "🖼 NFT",
+        "balance" : "💰 Balance",      "history": "📋 History",
+        "topup"   : "➕ Top up",
+        "referral": "👥 Referral",     "promo": "🎁 Promo code",
         "settings": "⚙️ Settings",
-        "cancel" : "❌ Cancel",
-        "self"   : "👤 Myself",
-        "other"  : "👥 Someone else",
+        "cancel"  : "❌ Cancel",
+        "self"    : "👤 Myself",       "other": "👥 Someone else",
     }
 }
 
@@ -335,39 +362,39 @@ def lang(uid) -> str:
 def tx(uid, key: str) -> str:
     return L[lang(uid)].get(key, L["uz"].get(key, key))
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # STATES
-# ═══════════════════════════════════════════
-class Order(StatesGroup):
-    username        = State()
-    stars_amount    = State()
-    nft_link        = State()
-    confirm         = State()
-    promo_input     = State()
+# ═══════════════════════════════════════
+class S(StatesGroup):
+    username    = State()
+    stars_input = State()
+    nft_link    = State()
+    promo_input = State()
 
-class Topup(StatesGroup):
+class T(StatesGroup):
     amount  = State()
     receipt = State()
 
-class Admin(StatesGroup):
-    card           = State()
-    markup         = State()
-    min_stars      = State()
-    channel        = State()
-    logs           = State()
-    broadcast      = State()
-    promo_code     = State()
-    promo_discount = State()
-    promo_limit    = State()
-    admin_id       = State()
-    ban_id         = State()
-    ref_bonus      = State()
+class A(StatesGroup):
+    card        = State()
+    markup      = State()
+    min_stars   = State()
+    channel     = State()
+    logs        = State()
+    broadcast   = State()
+    promo_code  = State()
+    promo_disc  = State()
+    promo_limit = State()
+    admin_id    = State()
+    ban_id      = State()
+    ref_bonus   = State()
+    lock_min    = State()
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # KLAVIATURA
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 def main_kb(uid) -> ReplyKeyboardMarkup:
-    d = db(); s = d["settings"]; l = lang(uid)
+    d = db(); l = lang(uid); s = d["settings"]
     rows = [
         [KeyboardButton(text=L[l]["premium"]), KeyboardButton(text=L[l]["stars"])],
         [KeyboardButton(text=L[l]["gifts"]),   KeyboardButton(text=L[l]["nft"])],
@@ -375,77 +402,74 @@ def main_kb(uid) -> ReplyKeyboardMarkup:
         [KeyboardButton(text=L[l]["topup"])],
     ]
     extra = []
-    if s.get("referral_active"):
-        extra.append(KeyboardButton(text=L[l]["referral"]))
-    if s.get("promo_active"):
-        extra.append(KeyboardButton(text=L[l]["promo"]))
-    if extra:
-        rows.append(extra)
+    if s.get("referral_active"): extra.append(KeyboardButton(text=L[l]["referral"]))
+    if s.get("promo_active"):    extra.append(KeyboardButton(text=L[l]["promo"]))
+    if extra: rows.append(extra)
     rows.append([KeyboardButton(text=L[l]["settings"])])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def cancel_kb(uid) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=tx(uid, "cancel"))]],
-        resize_keyboard=True
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=tx(uid, "cancel"))]], resize_keyboard=True)
 
 def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")]])
+
+def recip_kb(uid) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")
+        InlineKeyboardButton(text=tx(uid, "self"),  callback_data="rec_self"),
+        InlineKeyboardButton(text=tx(uid, "other"), callback_data="rec_other"),
     ]])
 
-# ═══════════════════════════════════════════
-# YORDAMCHI FUNKSIYALAR
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
+# YORDAMCHI
+# ═══════════════════════════════════════
+def price_bar() -> str:
+    if PRICES["ton_uzs"] == 0:
+        return "⏳ <i>Narxlar yuklanmoqda...</i>"
+    last = datetime.fromtimestamp(PRICES["last_update"]).strftime("%H:%M") if PRICES["last_update"] else "—"
+    return (
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
+        f"💎 1 TON = <b>{fmt(PRICES['ton_uzs'])} so'm</b>\n"
+        f"💵 1 USD = <b>{fmt(PRICES['usd_uzs'])} so'm</b>\n"
+        f"🕐 Narx yangilangan: <b>{last}</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>"
+    )
+
 async def send_log(text: str):
-    d = db()
-    ch = d["settings"].get("logs_channel")
+    d = db(); ch = d["settings"].get("logs_channel")
     if ch:
-        try:
-            await bot.send_message(ch, text, parse_mode="HTML")
-        except:
-            pass
+        try: await bot.send_message(ch, text, parse_mode="HTML")
+        except: pass
 
 async def notify_admins(text: str, kb=None, photo=None):
     d = db()
     admins = [SUPER_ADMIN_ID] + [int(a) for a in d.get("admins", {}).keys()]
     for aid in admins:
         try:
-            if photo:
-                await bot.send_photo(aid, photo, caption=text, reply_markup=kb, parse_mode="HTML")
-            else:
-                await bot.send_message(aid, text, reply_markup=kb, parse_mode="HTML")
-        except:
-            pass
+            if photo: await bot.send_photo(aid, photo, caption=text, reply_markup=kb, parse_mode="HTML")
+            else: await bot.send_message(aid, text, reply_markup=kb, parse_mode="HTML")
+        except: pass
 
 async def check_sub(uid: int) -> bool:
     d = db()
     for ch in d["settings"]["required_channels"]:
         try:
             m = await bot.get_chat_member(ch, uid)
-            if m.status in ["left", "kicked"]:
-                return False
-        except:
-            pass
+            if m.status in ["left", "kicked"]: return False
+        except: pass
     return True
 
-def price_info_text() -> str:
-    """Joriy kurs ma'lumoti"""
-    if PRICE_CACHE["ton_uzs"] == 0:
-        return "⏳ Narxlar yuklanmoqda..."
-    last = datetime.fromtimestamp(PRICE_CACHE["last_update"]).strftime("%H:%M")
-    return (
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
-        f"💎 1 TON = <b>{fmt(PRICE_CACHE['ton_uzs'])} so'm</b>\n"
-        f"💵 1 USD = <b>{fmt(PRICE_CACHE['usd_uzs'])} so'm</b>\n"
-        f"🕐 Oxirgi yangilanish: <b>{last}</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>"
-    )
+def price_lock_ok(locked_at: float) -> tuple[bool, int]:
+    """Narx muddati tekshiruvi. (ok, qolgan_daqiqa)"""
+    d = db()
+    timeout_min = d["settings"].get("price_lock_min", 15)
+    elapsed_min = (time.time() - locked_at) / 60
+    remaining   = max(0, int(timeout_min - elapsed_min))
+    return elapsed_min <= timeout_min, remaining
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # START
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
     await state.clear()
@@ -470,20 +494,13 @@ async def cmd_start(msg: types.Message, state: FSMContext):
                 d["users"][ref_id]["balance"] = d["users"][ref_id].get("balance", 0) + bonus
                 d["users"][ref_id]["referrals"] = d["users"][ref_id].get("referrals", 0) + 1
                 d["users"][ref_id]["ref_earned"] = d["users"][ref_id].get("ref_earned", 0) + bonus
-                try:
-                    await bot.send_message(
-                        int(ref_id),
-                        f"🎉 Yangi referral! +{fmt(bonus)} so'm!\n"
-                        f"💰 Balans: {fmt(d['users'][ref_id]['balance'])} so'm"
-                    )
-                except:
-                    pass
+                try: await bot.send_message(int(ref_id), f"🎉 Yangi referral! +{fmt(bonus)} so'm bonus!")
+                except: pass
         sdb(d)
 
     d = db()
     if d["users"][uid].get("banned"):
-        await msg.answer("🚫 Siz botdan bloklangansiz.")
-        return
+        await msg.answer("🚫 Siz botdan bloklangansiz."); return
 
     args = msg.text.split()
     if len(args) > 1 and args[1] == "admin" and is_admin(msg.from_user.id):
@@ -500,8 +517,7 @@ async def cmd_start(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def cb_lang(cb: types.CallbackQuery):
-    l = cb.data[5:]
-    set_user(cb.from_user.id, {"lang": l})
+    l = cb.data[5:]; set_user(cb.from_user.id, {"lang": l})
     if not await check_sub(cb.from_user.id):
         d = db(); chs = d["settings"]["required_channels"]
         btns = [[InlineKeyboardButton(text=f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] for ch in chs]
@@ -520,87 +536,73 @@ async def cb_check_sub(cb: types.CallbackQuery):
     else:
         await cb.answer("❌ Hali obuna bo'lmadingiz!", show_alert=True)
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # BALANS
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["💰 Balans", "💰 Баланс", "💰 Balance"]))
 async def cmd_balance(msg: types.Message):
-    u = get_user(msg.from_user.id)
-    bal = u.get("balance", 0)
+    u = get_user(msg.from_user.id); bal = u.get("balance", 0)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="➕ Hisob to'ldirish", callback_data="go_topup")
     ]])
     await msg.answer(
         f"💰 <b>Balansingiz</b>\n\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"💵 Joriy balans: <b>{fmt(bal)} so'm</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>",
+        f"<code>━━━━━━━━━━━━━━━━━━</code>",
         parse_mode="HTML", reply_markup=kb
     )
 
 @dp.callback_query(F.data == "go_topup")
 async def go_topup(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.delete()
-    await cmd_topup(cb.message, state)
+    await cb.message.delete(); await cmd_topup(cb.message, state)
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # HISOB TO'LDIRISH
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["➕ Hisob to'ldirish", "➕ Пополнить", "➕ Top up"]))
 async def cmd_topup(msg: types.Message, state: FSMContext):
     d = db()
     if not d["settings"]["cards"]:
-        await msg.answer("❌ Hozirda to'lov qabul qilinmayapti.")
-        return
+        await msg.answer("❌ Hozirda to'lov qabul qilinmayapti."); return
     await msg.answer(
-        "💰 <b>Hisob to'ldirish</b>\n\n"
-        "Qancha so'm kiritmoqchisiz?\n"
-        "<i>Minimum: 5 000 so'm</i>",
+        "💰 <b>Hisob to'ldirish</b>\n\nQancha so'm?\n<i>Minimum: 5 000 so'm</i>",
         parse_mode="HTML", reply_markup=cancel_kb(msg.from_user.id)
     )
-    await state.set_state(Topup.amount)
+    await state.set_state(T.amount)
 
-@dp.message(Topup.amount)
+@dp.message(T.amount)
 async def topup_amount(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
     try:
         amount = int(msg.text.replace(" ", "").replace(",", ""))
         if amount < 5000:
-            await msg.answer("❌ Minimum 5 000 so'm!")
-            return
-        d = db()
-        cards = "\n".join([f"💳 <code>{c}</code>" for c in d["settings"]["cards"]])
+            await msg.answer("❌ Minimum 5 000 so'm!"); return
+        d = db(); cards = "\n".join([f"💳 <code>{c}</code>" for c in d["settings"]["cards"]])
         await state.update_data(amount=amount)
         await msg.answer(
             f"💳 <b>To'lov kartasi:</b>\n\n{cards}\n\n"
-            f"<code>━━━━━━━━━━━━━━━━</code>\n"
-            f"💰 To'lov miqdori: <b>{fmt(amount)} so'm</b>\n"
-            f"<code>━━━━━━━━━━━━━━━━</code>\n\n"
+            f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
+            f"💰 Miqdor: <b>{fmt(amount)} so'm</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━</code>\n\n"
             f"✅ To'lovdan so'ng <b>chek (screenshot)</b> yuboring:",
             parse_mode="HTML", reply_markup=cancel_kb(msg.from_user.id)
         )
-        await state.set_state(Topup.receipt)
+        await state.set_state(T.receipt)
     except:
         await msg.answer("❌ Faqat raqam kiriting!")
 
-@dp.message(Topup.receipt)
+@dp.message(T.receipt)
 async def topup_receipt(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
     if not msg.photo:
-        await msg.answer("📸 Chek rasmini yuboring!")
-        return
-    data = await state.get_data()
-    amount = data["amount"]
-    uid = msg.from_user.id
+        await msg.answer("📸 Chek rasmini yuboring!"); return
+    data = await state.get_data(); amount = data["amount"]; uid = msg.from_user.id
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"tok_{uid}_{amount}"),
-        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"tno_{uid}"),
+        InlineKeyboardButton(text="❌ Rad etish",  callback_data=f"tno_{uid}"),
     ]])
     await notify_admins(
         f"💳 <b>Balans to'ldirish</b>\n\n"
@@ -610,32 +612,22 @@ async def topup_receipt(msg: types.Message, state: FSMContext):
         f"💰 <b>{fmt(amount)} so'm</b>",
         kb=kb, photo=msg.photo[-1].file_id
     )
-    await msg.answer(
-        "✅ <b>Chekingiz yuborildi!</b>\n\n⏳ Admin tasdiqlaguncha kuting...",
-        parse_mode="HTML", reply_markup=main_kb(msg.from_user.id)
-    )
+    await msg.answer("✅ <b>Chekingiz yuborildi!</b>\n\n⏳ Admin tasdiqlaguncha kuting...",
+                     parse_mode="HTML", reply_markup=main_kb(msg.from_user.id))
     await state.clear()
 
 @dp.callback_query(F.data.startswith("tok_"))
 async def topup_ok(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id): return
-    parts = cb.data.split("_")
-    uid, amount = int(parts[1]), int(parts[2])
+    parts = cb.data.split("_"); uid, amount = int(parts[1]), int(parts[2])
     d = db(); suid = str(uid)
     if suid in d["users"]:
-        d["users"][suid]["balance"] = d["users"][suid].get("balance", 0) + amount
-        sdb(d)
+        d["users"][suid]["balance"] = d["users"][suid].get("balance", 0) + amount; sdb(d)
     bal = d["users"].get(suid, {}).get("balance", 0)
     await bot.send_message(uid,
-        f"✅ <b>Balansingiz to'ldirildi!</b>\n\n"
-        f"➕ Qo'shildi: <b>{fmt(amount)} so'm</b>\n"
-        f"💰 Joriy balans: <b>{fmt(bal)} so'm</b>",
-        parse_mode="HTML"
-    )
-    await cb.message.edit_caption(
-        caption=cb.message.caption + f"\n\n✅ <b>Tasdiqlandi</b> — {cb.from_user.full_name}",
-        parse_mode="HTML"
-    )
+        f"✅ <b>Balansingiz to'ldirildi!</b>\n\n➕ <b>+{fmt(amount)} so'm</b>\n💰 Joriy: <b>{fmt(bal)} so'm</b>",
+        parse_mode="HTML")
+    await cb.message.edit_caption(caption=cb.message.caption + f"\n\n✅ Tasdiqlandi — {cb.from_user.full_name}", parse_mode="HTML")
     await send_log(f"✅ Balans +{fmt(amount)} so'm | ID: {uid}")
 
 @dp.callback_query(F.data.startswith("tno_"))
@@ -643,303 +635,229 @@ async def topup_no(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id): return
     uid = int(cb.data.split("_")[1])
     await bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi.")
-    await cb.message.edit_caption(
-        caption=cb.message.caption + f"\n\n❌ <b>Rad etildi</b> — {cb.from_user.full_name}",
-        parse_mode="HTML"
-    )
+    await cb.message.edit_caption(caption=cb.message.caption + f"\n\n❌ Rad etildi — {cb.from_user.full_name}", parse_mode="HTML")
 
-# ═══════════════════════════════════════════
-# KIMGA YUBORISH
-# ═══════════════════════════════════════════
-def recipient_kb(uid) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=tx(uid, "self"), callback_data="rec_self"),
-        InlineKeyboardButton(text=tx(uid, "other"), callback_data="rec_other"),
-    ]])
-
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # PREMIUM GIFT
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["⭐ Premium Gift"]))
 async def cmd_premium(msg: types.Message, state: FSMContext):
-    # Narxlar hozirgi kurs bilan (price lock)
-    p = {m: get_premium_price_uzs(m) for m in [3, 6, 12]}
+    await state.update_data(service="premium")
+    d = db(); lock_min = d["settings"].get("price_lock_min", 15)
+
+    # Narxlarni Fragment dan olingan qiymatlar bilan hisoblash
+    p = {m: get_premium_info(m) for m in [3, 6, 12]}
+    await state.update_data(price_data=p)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"3 oy — {fmt(p[3]['uzs'])} so'm",
-            callback_data="pm_3"
-        )],
-        [InlineKeyboardButton(
-            text=f"6 oy — {fmt(p[6]['uzs'])} so'm 🔥",
-            callback_data="pm_6"
-        )],
-        [InlineKeyboardButton(
-            text=f"12 oy — {fmt(p[12]['uzs'])} so'm",
-            callback_data="pm_12"
-        )],
+        [InlineKeyboardButton(text=f"3 oy — {fmt(p[3]['uzs'])} so'm",    callback_data="pm_3")],
+        [InlineKeyboardButton(text=f"6 oy — {fmt(p[6]['uzs'])} so'm 🔥", callback_data="pm_6")],
+        [InlineKeyboardButton(text=f"12 oy — {fmt(p[12]['uzs'])} so'm",  callback_data="pm_12")],
     ])
-
     await msg.answer(
         f"⭐ <b>Telegram Premium Gift</b>\n\n"
-        f"{price_info_text()}\n"
-        f"Muddatni tanlang:\n\n"
-        f"<i>⚠️ Narx {db()['settings'].get('order_timeout_min', 15)} daqiqa davomida qotib qoladi</i>",
+        f"{price_bar()}\n\n"
+        f"Fragment narxlari:\n"
+        f"• 3 oy = <b>{fmt_ton(p[3]['ton'])} TON</b>\n"
+        f"• 6 oy = <b>{fmt_ton(p[6]['ton'])} TON</b>\n"
+        f"• 12 oy = <b>{fmt_ton(p[12]['ton'])} TON</b>\n\n"
+        f"🔒 <i>Narx {lock_min} daqiqa qotib qoladi</i>\n\n"
+        f"Muddatni tanlang:",
         parse_mode="HTML", reply_markup=kb
     )
-    await state.update_data(service="premium", price_data=p)
 
 @dp.callback_query(F.data.startswith("pm_"))
-async def cb_premium_months(cb: types.CallbackQuery, state: FSMContext):
+async def cb_pm(cb: types.CallbackQuery, state: FSMContext):
     months = int(cb.data[3:])
-    data = await state.get_data()
-
-    # Agar narx ma'lumoti yo'q bo'lsa qayta olish
-    price_data = data.get("price_data", {})
-    if not price_data or months not in price_data:
-        pd = get_premium_price_uzs(months)
-    else:
-        pd = price_data[months]
-
-    await state.update_data(
-        months=months,
-        price=pd["uzs"],
-        ton=pd["ton"],
-        locked_at=pd["locked_at"],
-        locked_rate=pd["rate_uzs"]
-    )
+    data   = await state.get_data()
+    pd     = data.get("price_data", {}).get(months) or get_premium_info(months)
+    await state.update_data(months=months, price=pd["uzs"], ton=pd["ton"],
+                            locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"])
     await cb.message.delete()
     await cb.message.answer(
         f"⭐ <b>Premium {months} oy</b>\n"
-        f"💎 {fmt_ton(pd['ton'])} TON = <b>{fmt(pd['uzs'])} so'm</b>\n\n"
+        f"💎 Fragment narxi: <b>{fmt_ton(pd['ton'])} TON</b>\n"
+        f"💰 Sizga: <b>{fmt(pd['uzs'])} so'm</b>\n\n"
         f"Kimga yuboramiz?",
-        parse_mode="HTML", reply_markup=recipient_kb(cb.from_user.id)
+        parse_mode="HTML", reply_markup=recip_kb(cb.from_user.id)
     )
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # STARS
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["🌟 Stars"]))
 async def cmd_stars(msg: types.Message, state: FSMContext):
     await state.update_data(service="stars")
+    d = db(); min_s = d["settings"]["min_stars"]
+    lock_min = d["settings"].get("price_lock_min", 15)
 
-    # Narxlar hozirgi kurs bilan
     counts = [50, 100, 250, 500, 1000]
-    prices = {c: get_stars_price_uzs(c) for c in counts}
+    prices = {c: get_stars_info(c) for c in counts}
+    await state.update_data(price_data=prices)
 
-    buttons = []
-    row = []
+    # 1 star narxi
+    star_ton = PRICES["stars_rate"] or 0.00932
+    star_uzs = calc_uzs(star_ton)
+
+    btns = []
+    row  = []
     for i, c in enumerate(counts):
         row.append(InlineKeyboardButton(
-            text=f"⭐{c}\n{fmt(prices[c]['uzs'])} so'm",
+            text=f"⭐ {c} — {fmt(prices[c]['uzs'])} so'm",
             callback_data=f"st_{c}"
         ))
         if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton(text="✏️ Boshqa miqdor", callback_data="st_custom")])
+            btns.append(row); row = []
+    if row: btns.append(row)
+    btns.append([InlineKeyboardButton(text="✏️ Boshqa miqdor", callback_data="st_custom")])
 
     await msg.answer(
         f"🌟 <b>Telegram Stars</b>\n\n"
-        f"{price_info_text()}\n"
-        f"Miqdorni tanlang:\n\n"
-        f"<i>⚠️ Narx {db()['settings'].get('order_timeout_min', 15)} daqiqa davomida qotib qoladi</i>",
+        f"{price_bar()}\n\n"
+        f"⭐ 1 Star = <b>{fmt_ton(star_ton)} TON</b> = <b>{fmt(star_uzs)} so'm</b>\n\n"
+        f"🔒 <i>Narx {lock_min} daqiqa qotib qoladi</i>\n\n"
+        f"Miqdorni tanlang:",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns)
     )
-    await state.update_data(price_data=prices)
 
 @dp.callback_query(F.data.startswith("st_"))
-async def cb_stars_select(cb: types.CallbackQuery, state: FSMContext):
-    val = cb.data[3:]
+async def cb_st(cb: types.CallbackQuery, state: FSMContext):
+    val  = cb.data[3:]
     data = await state.get_data()
-
     if val == "custom":
-        d = db()
-        min_s = d["settings"]["min_stars"]
+        d = db(); min_s = d["settings"]["min_stars"]
         await cb.message.edit_text(
-            f"🌟 Nechta Stars?\n\n"
-            f"<i>Minimum: {min_s} | Maksimum: 100 000</i>\n\n"
-            f"{price_info_text()}",
+            f"🌟 Nechta Stars?\n\n<i>Minimum: {min_s}</i>\n\n{price_bar()}",
             parse_mode="HTML"
         )
-        await state.set_state(Order.stars_amount)
-        return
+        await state.set_state(S.stars_input); return
 
-    stars = int(val)
-    price_data = data.get("price_data", {})
-    if stars in price_data:
-        pd = price_data[stars]
-    else:
-        pd = get_stars_price_uzs(stars)
-
-    await state.update_data(
-        stars=stars,
-        price=pd["uzs"],
-        ton=pd["ton"],
-        locked_at=pd["locked_at"],
-        locked_rate=pd["rate_uzs"]
-    )
+    count = int(val)
+    pd    = data.get("price_data", {}).get(count) or get_stars_info(count)
+    await state.update_data(stars=count, price=pd["uzs"], ton=pd["ton"],
+                            locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"])
     await cb.message.delete()
     await cb.message.answer(
-        f"🌟 <b>{stars} Stars</b>\n"
-        f"💎 {fmt_ton(pd['ton'])} TON = <b>{fmt(pd['uzs'])} so'm</b>\n\n"
+        f"🌟 <b>{fmt(count)} Stars</b>\n"
+        f"💎 Fragment narxi: <b>{fmt_ton(pd['ton'])} TON</b>\n"
+        f"💰 Sizga: <b>{fmt(pd['uzs'])} so'm</b>\n\n"
         f"Kimga yuboramiz?",
-        parse_mode="HTML", reply_markup=recipient_kb(cb.from_user.id)
+        parse_mode="HTML", reply_markup=recip_kb(cb.from_user.id)
     )
 
-@dp.message(Order.stars_amount)
-async def enter_stars_amount(msg: types.Message, state: FSMContext):
+@dp.message(S.stars_input)
+async def enter_stars(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
-    d = db()
-    min_s = d["settings"]["min_stars"]
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
+    d = db(); min_s = d["settings"]["min_stars"]
     try:
-        stars = int(msg.text.replace(" ", ""))
-        if stars < min_s:
-            await msg.answer(f"❌ Minimum <b>{min_s}</b> Stars!", parse_mode="HTML")
-            return
-        if stars > 100000:
-            await msg.answer("❌ Maksimum 100 000 Stars!")
-            return
-        pd = get_stars_price_uzs(stars)
-        await state.update_data(
-            stars=stars,
-            price=pd["uzs"],
-            ton=pd["ton"],
-            locked_at=pd["locked_at"],
-            locked_rate=pd["rate_uzs"]
-        )
+        count = int(msg.text.replace(" ", ""))
+        if count < min_s:
+            await msg.answer(f"❌ Minimum <b>{min_s}</b> Stars!", parse_mode="HTML"); return
+        pd = get_stars_info(count)
+        await state.update_data(stars=count, price=pd["uzs"], ton=pd["ton"],
+                                locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"])
         await msg.answer(
-            f"🌟 <b>{fmt(stars)} Stars</b>\n"
-            f"💎 {fmt_ton(pd['ton'])} TON = <b>{fmt(pd['uzs'])} so'm</b>\n\n"
+            f"🌟 <b>{fmt(count)} Stars</b>\n"
+            f"💎 Fragment narxi: <b>{fmt_ton(pd['ton'])} TON</b>\n"
+            f"💰 Sizga: <b>{fmt(pd['uzs'])} so'm</b>\n\n"
             f"Kimga yuboramiz?",
-            parse_mode="HTML", reply_markup=recipient_kb(msg.from_user.id)
+            parse_mode="HTML", reply_markup=recip_kb(msg.from_user.id)
         )
     except:
         await msg.answer("❌ Faqat raqam kiriting!")
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # GIFTS
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["🎁 Gifts"]))
 async def cmd_gifts(msg: types.Message, state: FSMContext):
     await state.update_data(service="gifts")
     await msg.answer(
         "🎁 <b>Telegram Gifts</b>\n\n"
-        "Fragment.com da mavjud gift linkini yuboring:\n\n"
+        "Fragment.com dan gift linkini yuboring:\n\n"
         "<i>https://fragment.com/gift/...</i>",
         parse_mode="HTML", reply_markup=cancel_kb(msg.from_user.id)
     )
-    await state.set_state(Order.nft_link)
+    await state.set_state(S.nft_link)
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # NFT
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["🖼 NFT"]))
 async def cmd_nft(msg: types.Message, state: FSMContext):
     await state.update_data(service="nft")
     await msg.answer(
-        "🖼 <b>Fragment NFT</b>\n\n"
-        "Fragment.com da NFT linkini yuboring:\n\n"
+        "🖼 <b>Fragment NFT / Username / Number</b>\n\n"
+        "Fragment.com dan linkini yuboring:\n\n"
         "<i>https://fragment.com/username/...</i>\n"
         "<i>https://fragment.com/number/...</i>",
         parse_mode="HTML", reply_markup=cancel_kb(msg.from_user.id)
     )
-    await state.set_state(Order.nft_link)
+    await state.set_state(S.nft_link)
 
-@dp.message(Order.nft_link)
-async def enter_nft_link(msg: types.Message, state: FSMContext):
+@dp.message(S.nft_link)
+async def enter_nft(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
     if "fragment.com" not in msg.text:
-        await msg.answer(
-            "❌ <b>Noto'g'ri link!</b>\n\nfragment.com dan link yuboring.",
-            parse_mode="HTML"
-        )
-        return
+        await msg.answer("❌ <b>fragment.com</b> dan link yuboring!", parse_mode="HTML"); return
 
     wait = await msg.answer("⏳ Ma'lumotlar olinmoqda...")
-    data = await state.get_data()
-    service = data.get("service", "nft")
+    data = await state.get_data(); service = data.get("service", "nft")
 
     try:
         from FragmentAPI import SyncFragmentAPI
         api = SyncFragmentAPI(cookies=FRAGMENT_COOKIES, wallet_api_key=TON_API_KEY)
         info = api.get_nft_info(msg.text)
         ton_price = float(info.price) if hasattr(info, 'price') and info.price else 5.0
-        item_name = str(info.name) if hasattr(info, 'name') and info.name else "NFT"
+        item_name = str(info.name)   if hasattr(info, 'name')  and info.name  else "NFT"
     except Exception as e:
         log.error(f"NFT info: {e}")
-        ton_price = 5.0
-        item_name = "NFT/Gift"
+        ton_price = 5.0; item_name = "NFT/Gift"
 
-    # Narxni hozirgi kurs bilan qotirish
-    d_settings = db()
-    markup = d_settings["settings"]["markup"]
-    rate   = PRICE_CACHE["ton_uzs"] or 44800.0
-    uzs    = round(ton_price * rate * (1 + markup / 100))
+    uzs       = calc_uzs(ton_price)
     locked_at = time.time()
-
-    await state.update_data(
-        nft_link=msg.text,
-        nft_name=item_name,
-        price=uzs,
-        ton=ton_price,
-        locked_at=locked_at,
-        locked_rate=rate
-    )
-
+    await state.update_data(nft_link=msg.text, nft_name=item_name,
+                            price=uzs, ton=ton_price,
+                            locked_at=locked_at, locked_rate=PRICES["ton_uzs"])
     await wait.delete()
+    icon = "🎁" if service == "gifts" else "🖼"
     await msg.answer(
-        f"{'🎁' if service=='gifts' else '🖼'} <b>{item_name}</b>\n\n"
+        f"{icon} <b>{item_name}</b>\n\n"
         f"💎 Fragment narxi: <b>{fmt_ton(ton_price)} TON</b>\n"
-        f"💰 Sizga narx: <b>{fmt(uzs)} so'm</b>\n\n"
+        f"💰 Sizga: <b>{fmt(uzs)} so'm</b>\n\n"
         f"Kimga yuboramiz?",
-        parse_mode="HTML", reply_markup=recipient_kb(msg.from_user.id)
+        parse_mode="HTML", reply_markup=recip_kb(msg.from_user.id)
     )
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # RECIPIENT
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.callback_query(F.data == "rec_self")
 async def rec_self(cb: types.CallbackQuery, state: FSMContext):
     if not cb.from_user.username:
-        await cb.answer(
-            "❌ Username ingiz yo'q!\nTelegram sozlamalaridan o'rnating.",
-            show_alert=True
-        )
-        return
+        await cb.answer("❌ Username ingiz yo'q! Telegram sozlamalaridan o'rnating.", show_alert=True); return
     await state.update_data(username=cb.from_user.username)
     await cb.message.delete()
     await show_confirm(cb.message, state, cb.from_user.id)
 
 @dp.callback_query(F.data == "rec_other")
 async def rec_other(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text(
-        "👤 <b>Username kiriting:</b>\n\n<i>Masalan: @username</i>",
-        parse_mode="HTML"
-    )
-    await state.set_state(Order.username)
+    await cb.message.edit_text("👤 <b>Username kiriting:</b>\n\n<i>@username yoki username</i>", parse_mode="HTML")
+    await state.set_state(S.username)
 
-@dp.message(Order.username)
+@dp.message(S.username)
 async def enter_username(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
     await state.update_data(username=msg.text.strip().lstrip("@"))
     await show_confirm(msg, state, msg.from_user.id)
 
-# ═══════════════════════════════════════════
-# TASDIQLASH (PRICE LOCK TEKSHIRUVI)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
+# TASDIQLASH (PRICE LOCK)
+# ═══════════════════════════════════════
 async def show_confirm(msg, state, uid):
     data    = await state.get_data()
     d       = db()
@@ -947,195 +865,153 @@ async def show_confirm(msg, state, uid):
     price   = data.get("price", 0)
     uname   = data.get("username", "?")
     svc     = data.get("service", "")
-    locked_at  = data.get("locked_at", time.time())
-    locked_rate = data.get("locked_rate", PRICE_CACHE["ton_uzs"])
-    timeout = d["settings"].get("order_timeout_min", 15)
+    locked_at = data.get("locked_at", time.time())
 
-    # Price lock muddati tekshiruvi
-    elapsed = (time.time() - locked_at) / 60
-    if elapsed > timeout:
+    ok, remaining = price_lock_ok(locked_at)
+
+    if not ok:
         # Narx eskirgan — qayta hisoblash
         if svc == "premium":
-            months = data.get("months", 3)
-            pd = get_premium_price_uzs(months)
+            pd = get_premium_info(data.get("months", 3))
             price = pd["uzs"]
-            await state.update_data(
-                price=price, ton=pd["ton"],
-                locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"]
-            )
+            await state.update_data(price=price, ton=pd["ton"],
+                                    locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"])
         elif svc == "stars":
-            stars = data.get("stars", 50)
-            pd = get_stars_price_uzs(stars)
+            pd = get_stars_info(data.get("stars", 50))
             price = pd["uzs"]
-            await state.update_data(
-                price=price, ton=pd["ton"],
-                locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"]
-            )
-        note = "⚠️ <i>Narx yangilandi (eski narx eskirgan edi)</i>\n\n"
+            await state.update_data(price=price, ton=pd["ton"],
+                                    locked_at=pd["locked_at"], locked_rate=pd["rate_uzs"])
+        note = "⚠️ <i>Narx yangilandi (muddati tugagan edi)</i>\n\n"
     else:
-        remaining = int(timeout - elapsed)
         note = f"🔒 <i>Narx {remaining} daqiqa davomida qotib turibdi</i>\n\n"
 
-    # Xizmat nomi
-    svc_names = {
+    svc_txt = {
         "premium": f"⭐ Premium {data.get('months', 3)} oy",
         "stars"  : f"🌟 {fmt(data.get('stars', 50))} Stars",
         "gifts"  : f"🎁 {data.get('nft_name', 'Gift')}",
         "nft"    : f"🖼 {data.get('nft_name', 'NFT')}",
-    }
-    svc_txt = svc_names.get(svc, svc)
-    ton     = data.get("ton", 0)
-    enough  = bal >= price
+    }.get(svc, svc)
 
-    status = (
-        "✅ Balans yetarli" if enough
-        else f"❌ Balans yetarli emas!\nKerak: <b>{fmt(price)}</b> | Sizda: <b>{fmt(bal)}</b> so'm"
-    )
+    ton    = data.get("ton", 0)
+    enough = bal >= price
+    status = ("✅ Balans yetarli" if enough
+              else f"❌ Balans yetarli emas!\nKerak: <b>{fmt(price)}</b> | Sizda: <b>{fmt(bal)}</b> so'm")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="ord_ok"),
-        InlineKeyboardButton(text="❌ Bekor", callback_data="ord_no"),
+        InlineKeyboardButton(text="❌ Bekor",      callback_data="ord_no"),
     ]])
-
     await msg.answer(
         f"📋 <b>Buyurtma tasdiqlash</b>\n\n"
         f"{note}"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"🛍 Xizmat: <b>{svc_txt}</b>\n"
         f"👤 Kimga: <b>@{uname}</b>\n"
-        f"💎 TON: <b>{fmt_ton(ton)} TON</b>\n"
-        f"💰 Narx: <b>{fmt(price)} so'm</b>\n"
+        f"💎 Fragment: <b>{fmt_ton(ton)} TON</b>\n"
+        f"💰 To'lov: <b>{fmt(price)} so'm</b>\n"
         f"💳 Balansingiz: <b>{fmt(bal)} so'm</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"{status}",
         parse_mode="HTML", reply_markup=kb
     )
 
 @dp.callback_query(F.data == "ord_ok")
 async def order_ok(cb: types.CallbackQuery, state: FSMContext):
-    data    = await state.get_data()
-    d       = db()
-    uid     = str(cb.from_user.id)
-    bal     = d["users"].get(uid, {}).get("balance", 0)
-    price   = data.get("price", 0)
-    timeout = d["settings"].get("order_timeout_min", 15)
+    data = await state.get_data()
+    d    = db(); uid = str(cb.from_user.id)
+    bal  = d["users"].get(uid, {}).get("balance", 0)
+    price = data.get("price", 0)
 
-    # Price lock muddati tekshiruvi (oxirgi)
+    # Price lock oxirgi tekshiruv
     locked_at = data.get("locked_at", time.time())
-    elapsed   = (time.time() - locked_at) / 60
-    if elapsed > timeout:
-        await cb.answer(
-            "⚠️ Narx muddati tugadi!\nIltimos buyurtmani qayta bering.",
-            show_alert=True
-        )
+    ok, _ = price_lock_ok(locked_at)
+    if not ok:
+        await cb.answer("⚠️ Narx muddati tugadi! Qayta buyurtma bering.", show_alert=True)
         await state.clear()
-        await cb.message.edit_text("⏰ Narx muddati tugadi. /start dan qayta boshlang.")
+        await cb.message.edit_text("⏰ Narx muddati tugadi.\n\nIltimos xizmatni qaytadan tanlang.")
         return
 
     if bal < price:
-        await cb.answer(
-            f"❌ Balans yetarli emas!\nKerak: {fmt(price)} | Sizda: {fmt(bal)} so'm",
-            show_alert=True
-        )
+        await cb.answer(f"❌ Balans yetarli emas!\nKerak: {fmt(price)} | Sizda: {fmt(bal)} so'm", show_alert=True)
         return
 
-    await cb.message.edit_text(
-        "⏳ <b>Buyurtma bajarilmoqda...</b>\n\nFragment API ga so'rov yuborilmoqda...",
-        parse_mode="HTML"
-    )
+    await cb.message.edit_text("⏳ <b>Buyurtma bajarilmoqda...</b>\n\nFragment API ga yuborilmoqda...", parse_mode="HTML")
 
     # Balansdan yechish
     d["users"][uid]["balance"] -= price
-
     svc = data.get("service", "")
-    svc_names = {
+    svc_txt = {
         "premium": f"⭐ Premium {data.get('months', 3)} oy",
         "stars"  : f"🌟 {fmt(data.get('stars', 50))} Stars",
         "gifts"  : f"🎁 {data.get('nft_name', 'Gift')}",
         "nft"    : f"🖼 {data.get('nft_name', 'NFT')}",
-    }
-    svc_txt = svc_names.get(svc, svc)
-    ton     = data.get("ton", 0)
+    }.get(svc, svc)
+    ton = data.get("ton", 0)
 
     order = {
-        "id"        : len(d["orders"]) + 1,
-        "user_id"   : uid,
-        "service"   : svc,
-        "username"  : data.get("username"),
-        "months"    : data.get("months"),
-        "stars"     : data.get("stars"),
-        "nft_link"  : data.get("nft_link"),
-        "nft_name"  : data.get("nft_name"),
-        "price"     : price,
-        "ton"       : ton,
+        "id"         : len(d["orders"]) + 1,
+        "user_id"    : uid,
+        "service"    : svc,
+        "username"   : data.get("username"),
+        "months"     : data.get("months"),
+        "stars"      : data.get("stars"),
+        "nft_link"   : data.get("nft_link"),
+        "nft_name"   : data.get("nft_name"),
+        "price"      : price,
+        "ton"        : ton,
         "locked_rate": data.get("locked_rate"),
-        "status"    : "processing",
-        "created_at": datetime.now().isoformat(),
+        "status"     : "processing",
+        "created_at" : datetime.now().isoformat(),
     }
     d["orders"].append(order)
     d["users"][uid].setdefault("orders", []).append(order["id"])
     sdb(d)
 
-    success = await fragment_send(order)
+    success = await do_fragment(order)
     d = db()
 
     if success:
         for o in d["orders"]:
-            if o["id"] == order["id"]:
-                o["status"] = "completed"
+            if o["id"] == order["id"]: o["status"] = "completed"
         sdb(d)
         await cb.message.edit_text(
             f"🎉 <b>Muvaffaqiyatli yuborildi!</b>\n\n"
-            f"<code>━━━━━━━━━━━━━━━━</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
             f"🛍 {svc_txt}\n"
             f"👤 @{order['username']}\n"
             f"💎 {fmt_ton(ton)} TON\n"
             f"💰 {fmt(price)} so'm\n"
-            f"<code>━━━━━━━━━━━━━━━━</code>\n\n"
+            f"<code>━━━━━━━━━━━━━━━━━━</code>\n\n"
             f"✨ Xarid uchun rahmat!",
             parse_mode="HTML"
         )
-        await send_log(
-            f"✅ <b>Buyurtma #{order['id']}</b>\n"
-            f"🛍 {svc_txt}\n"
-            f"👤 @{order['username']}\n"
-            f"💎 {fmt_ton(ton)} TON = {fmt(price)} so'm\n"
-            f"🆔 UserID: {uid}"
-        )
+        await send_log(f"✅ #{order['id']} | {svc_txt} → @{order['username']} | {fmt_ton(ton)} TON = {fmt(price)} so'm | ID:{uid}")
     else:
         d["users"][uid]["balance"] += price
         for o in d["orders"]:
-            if o["id"] == order["id"]:
-                o["status"] = "failed"
+            if o["id"] == order["id"]: o["status"] = "failed"
         sdb(d)
         await cb.message.edit_text(
-            "❌ <b>Xato yuz berdi!</b>\n\n"
-            "Balans qaytarildi.\n"
-            "Sabab: Fragment API xatosi.\n"
-            "Admin bilan bog'laning.",
+            "❌ <b>Xato yuz berdi!</b>\n\nBalans qaytarildi.\nAdmin bilan bog'laning.",
             parse_mode="HTML"
         )
-        await send_log(
-            f"❌ <b>Buyurtma #{order['id']} XATO</b>\n"
-            f"🛍 {svc_txt}\n👤 @{order['username']}\n🆔 {uid}"
-        )
+        await send_log(f"❌ #{order['id']} | {svc_txt} → @{order['username']} | XATO | ID:{uid}")
     await state.clear()
 
 @dp.callback_query(F.data == "ord_no")
 async def order_no(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("❌ Buyurtma bekor qilindi.")
+    await state.clear(); await cb.message.edit_text("❌ Buyurtma bekor qilindi.")
 
-# ═══════════════════════════════════════════
-# FRAGMENT API
-# ═══════════════════════════════════════════
-async def fragment_send(order: dict) -> bool:
+# ═══════════════════════════════════════
+# FRAGMENT API — YUBORISH
+# ═══════════════════════════════════════
+async def do_fragment(order: dict) -> bool:
     try:
         from FragmentAPI import SyncFragmentAPI
         api = SyncFragmentAPI(cookies=FRAGMENT_COOKIES, wallet_api_key=TON_API_KEY)
         svc = order["service"]
         if svc == "premium":
-            r = api.buy_premium(order["username"], order["months"])
+            r = api.gift_premium(order["username"], order["months"])
         elif svc == "stars":
             r = api.buy_stars(order["username"], order["stars"])
         elif svc in ("nft", "gifts"):
@@ -1144,103 +1020,78 @@ async def fragment_send(order: dict) -> bool:
             return False
         return bool(r)
     except Exception as e:
-        log.error(f"Fragment send error: {e}")
+        log.error(f"Fragment do_fragment: {e}")
         return False
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # TARIX
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["📋 Tarix", "📋 История", "📋 History"]))
 async def cmd_history(msg: types.Message):
     d = db(); uid = str(msg.from_user.id)
     orders = [o for o in d["orders"] if o["user_id"] == uid][-10:]
     if not orders:
-        await msg.answer(
-            "📋 <b>Buyurtmalar tarixi</b>\n\nHali buyurtmalar yo'q.",
-            parse_mode="HTML"
-        )
-        return
+        await msg.answer("📋 <b>Buyurtmalar tarixi</b>\n\nHali buyurtmalar yo'q.", parse_mode="HTML"); return
     st = {"completed": "✅", "failed": "❌", "processing": "⏳"}
-    svc_n = lambda o: {
-        "premium": f"Premium {o.get('months', 3)}oy",
-        "stars"  : f"{fmt(o.get('stars', 0))} ⭐",
-        "gifts"  : f"Gift",
-        "nft"    : f"NFT",
-    }.get(o["service"], o["service"])
-
-    text = "📋 <b>Buyurtmalaringiz:</b>\n<code>━━━━━━━━━━━━━━━━</code>\n\n"
+    sn = lambda o: {"premium": f"Premium {o.get('months',3)}oy", "stars": f"{fmt(o.get('stars',0))}⭐", "gifts": "Gift🎁", "nft": "NFT🖼"}.get(o["service"], o["service"])
+    text = "📋 <b>Buyurtmalaringiz:</b>\n<code>━━━━━━━━━━━━━━━━━━</code>\n\n"
     for o in reversed(orders):
         text += (
-            f"{st.get(o['status'], '❓')} <b>#{o['id']}</b> — {svc_n(o)}\n"
-            f"   👤 @{o.get('username', '?')} | "
-            f"💎 {fmt_ton(o.get('ton', 0))} TON | "
-            f"💰 {fmt(o['price'])} so'm\n\n"
+            f"{st.get(o['status'],'❓')} <b>#{o['id']}</b> — {sn(o)}\n"
+            f"   👤 @{o.get('username','?')} | 💎 {fmt_ton(o.get('ton',0))} TON | 💰 {fmt(o['price'])} so'm\n\n"
         )
     await msg.answer(text, parse_mode="HTML")
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # REFERRAL
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["👥 Referral", "👥 Реферал"]))
 async def cmd_referral(msg: types.Message):
     d = db()
     if not d["settings"].get("referral_active"): return
     uid = str(msg.from_user.id); u = d["users"].get(uid, {})
-    me = await bot.get_me()
-    link  = f"https://t.me/{me.username}?start=ref_{uid}"
+    me = await bot.get_me(); link = f"https://t.me/{me.username}?start=ref_{uid}"
     bonus = d["settings"]["referral_bonus"]
     await msg.answer(
         f"👥 <b>Referral tizimi</b>\n\n"
-        f"Do'stlarni taklif qiling va bonus oling!\n\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"🔗 Havola:\n<code>{link}</code>\n\n"
-        f"👥 Taklif qilganlar: <b>{u.get('referrals', 0)}</b>\n"
-        f"💰 Jami bonus: <b>{fmt(u.get('ref_earned', 0))} so'm</b>\n"
+        f"👥 Taklif qilganlar: <b>{u.get('referrals',0)}</b>\n"
+        f"💰 Jami bonus: <b>{fmt(u.get('ref_earned',0))} so'm</b>\n"
         f"🎁 Har bir do'st: <b>{fmt(bonus)} so'm</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>",
+        f"<code>━━━━━━━━━━━━━━━━━━</code>",
         parse_mode="HTML"
     )
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # PROMO KOD
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["🎁 Promo kod", "🎁 Промо код", "🎁 Promo code"]))
 async def cmd_promo(msg: types.Message, state: FSMContext):
     d = db()
     if not d["settings"].get("promo_active"): return
     await msg.answer("🎁 <b>Promo kodingizni kiriting:</b>", parse_mode="HTML", reply_markup=cancel_kb(msg.from_user.id))
-    await state.set_state(Order.promo_input)
+    await state.set_state(S.promo_input)
 
-@dp.message(Order.promo_input)
+@dp.message(S.promo_input)
 async def enter_promo(msg: types.Message, state: FSMContext):
     if msg.text in ["❌ Bekor", "❌ Отмена", "❌ Cancel"]:
-        await state.clear()
-        await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id))
-        return
-    d = db(); uid = str(msg.from_user.id)
-    code = msg.text.strip().upper()
+        await state.clear(); await msg.answer("🏠", reply_markup=main_kb(msg.from_user.id)); return
+    d = db(); uid = str(msg.from_user.id); code = msg.text.strip().upper()
     promos = d.get("promo_codes", {})
     if code not in promos:
-        await msg.answer("❌ Noto'g'ri promo kod!", reply_markup=main_kb(msg.from_user.id))
-        await state.clear(); return
+        await msg.answer("❌ Noto'g'ri promo kod!", reply_markup=main_kb(msg.from_user.id)); await state.clear(); return
     promo = promos[code]
     if promo.get("limit") and promo.get("used", 0) >= promo["limit"]:
-        await msg.answer("❌ Bu promo kodning limiti tugagan!", reply_markup=main_kb(msg.from_user.id))
-        await state.clear(); return
+        await msg.answer("❌ Bu promo kodning limiti tugagan!", reply_markup=main_kb(msg.from_user.id)); await state.clear(); return
     if code in d["users"].get(uid, {}).get("promo_used", []):
-        await msg.answer("❌ Bu promo kodni allaqachon ishlatgansiz!", reply_markup=main_kb(msg.from_user.id))
-        await state.clear(); return
-    await msg.answer(
-        f"✅ <b>Promo kod qo'llandi!</b>\n\n"
-        f"🎁 Kod: <code>{code}</code>\n"
-        f"📉 Chegirma: <b>-{promo['discount']}%</b>",
-        parse_mode="HTML", reply_markup=main_kb(msg.from_user.id)
-    )
+        await msg.answer("❌ Bu promo kodni allaqachon ishlatgansiz!", reply_markup=main_kb(msg.from_user.id)); await state.clear(); return
+    await msg.answer(f"✅ <b>Promo kod qo'llandi!</b>\n\n🎁 <code>{code}</code>\n📉 <b>-{promo['discount']}%</b>", parse_mode="HTML", reply_markup=main_kb(msg.from_user.id))
     await state.clear()
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # SOZLAMALAR
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 @dp.message(F.text.in_(["⚙️ Sozlamalar", "⚙️ Настройки", "⚙️ Settings"]))
 async def cmd_settings(msg: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1252,14 +1103,13 @@ async def cmd_settings(msg: types.Message):
 
 @dp.callback_query(F.data.startswith("sl_"))
 async def cb_setlang(cb: types.CallbackQuery):
-    l = cb.data[3:]
-    set_user(cb.from_user.id, {"lang": l})
+    l = cb.data[3:]; set_user(cb.from_user.id, {"lang": l})
     await cb.message.delete()
     await cb.message.answer(L[l]["welcome"], parse_mode="HTML", reply_markup=main_kb(cb.from_user.id))
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # ADMIN PANEL
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 def admin_kb(uid) -> InlineKeyboardMarkup:
     d = db(); sup = is_super(uid)
     rows = [
@@ -1277,43 +1127,51 @@ def admin_kb(uid) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎁 Promo", callback_data="adm_promos"),
              InlineKeyboardButton(text="👥 Referral", callback_data="adm_referral")],
             [InlineKeyboardButton(
-                text=f"🤖 Bot {'O\'CHIRISH ❌' if d['settings']['bot_active'] else 'YOQISH ✅'}",
+                text=f"🤖 Bot {'O\'CH ❌' if d['settings']['bot_active'] else 'YOQ ✅'}",
                 callback_data="adm_toggle_bot"
             )],
-            [InlineKeyboardButton(text="🔄 Narxlarni yangilash", callback_data="adm_refresh_prices")],
+            [InlineKeyboardButton(text="🔄 Narxlarni yangilash", callback_data="adm_refresh")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def adm_text() -> str:
-    d = db()
-    total = len(d["users"])
-    orders = len(d["orders"])
-    done  = len([o for o in d["orders"] if o["status"] == "completed"])
-    rev   = sum(o["price"] for o in d["orders"] if o["status"] == "completed")
+    d = db(); total = len(d["users"]); orders = len(d["orders"])
+    done = len([o for o in d["orders"] if o["status"] == "completed"])
+    rev  = sum(o["price"] for o in d["orders"] if o["status"] == "completed")
     today = datetime.now().date().isoformat()
     t_rev = sum(o["price"] for o in d["orders"] if o["status"] == "completed" and o["created_at"][:10] == today)
-
-    rate_ton = PRICE_CACHE.get("ton_uzs", 0)
-    stars_ton = PRICE_CACHE.get("stars_ton", 0)
-    last_upd = PRICE_CACHE.get("last_update", 0)
-    last_str = datetime.fromtimestamp(last_upd).strftime("%H:%M") if last_upd else "—"
     markup = d["settings"]["markup"]
+    lock = d["settings"].get("price_lock_min", 15)
+    last = datetime.fromtimestamp(PRICES["last_update"]).strftime("%H:%M") if PRICES["last_update"] else "—"
+
+    p3  = PRICES["premium"].get(3, 0)
+    p6  = PRICES["premium"].get(6, 0)
+    p12 = PRICES["premium"].get(12, 0)
+    sr  = PRICES["stars_rate"]
 
     return (
         f"👨‍💼 <b>Admin Panel — U-Gift Bot</b>\n\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
-        f"💎 1 TON = <b>{fmt(rate_ton)} so'm</b>\n"
-        f"⭐ 1 Star = <b>{fmt_ton(stars_ton)} TON</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
+        f"💎 1 TON = <b>{fmt(PRICES['ton_uzs'])} so'm</b>\n"
+        f"💵 1 USD = <b>{fmt(PRICES['usd_uzs'])} so'm</b>\n"
+        f"⭐ 1 Star = <b>{fmt_ton(sr)} TON</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
+        f"Fragment Premium narxlari:\n"
+        f"• 3 oy = <b>{fmt_ton(p3)} TON</b>\n"
+        f"• 6 oy = <b>{fmt_ton(p6)} TON</b>\n"
+        f"• 12 oy = <b>{fmt_ton(p12)} TON</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"📈 Ustiga foiz: <b>{markup}%</b>\n"
-        f"🕐 Narx yangilangan: <b>{last_str}</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"🔒 Narx qulfi: <b>{lock} daqiqa</b>\n"
+        f"🕐 Oxirgi yangilanish: <b>{last}</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"👥 Foydalanuvchilar: <b>{total}</b>\n"
         f"📋 Jami buyurtmalar: <b>{orders}</b>\n"
         f"✅ Bajarilgan: <b>{done}</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>\n"
         f"📅 Bugungi daromad: <b>{fmt(t_rev)} so'm</b>\n"
         f"💰 Jami daromad: <b>{fmt(rev)} so'm</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>"
+        f"<code>━━━━━━━━━━━━━━━━━━</code>"
     )
 
 @dp.message(Command("admin"))
@@ -1331,13 +1189,13 @@ async def cb_adm_main(cb: types.CallbackQuery, state: FSMContext):
     except:
         await cb.message.answer(await adm_text(), parse_mode="HTML", reply_markup=admin_kb(cb.from_user.id))
 
-@dp.callback_query(F.data == "adm_refresh_prices")
-async def adm_refresh_prices(cb: types.CallbackQuery):
+@dp.callback_query(F.data == "adm_refresh")
+async def adm_refresh(cb: types.CallbackQuery):
     if not is_super(cb.from_user.id): return
     await cb.answer("⏳ Narxlar yangilanmoqda...", show_alert=False)
-    PRICE_CACHE["last_update"] = 0
-    await update_prices(force=True)
-    await cb.answer(f"✅ Narxlar yangilandi! 1 TON = {fmt(PRICE_CACHE['ton_uzs'])} so'm", show_alert=True)
+    PRICES["last_update"] = 0
+    await update_all_prices(force=True)
+    await cb.answer(f"✅ Yangilandi! 1 TON = {fmt(PRICES['ton_uzs'])} so'm", show_alert=True)
     await cb_adm_main(cb, None)
 
 @dp.callback_query(F.data == "adm_stats")
@@ -1349,72 +1207,56 @@ async def cb_stats(cb: types.CallbackQuery):
     total_rev = sum(o["price"] for o in d["orders"] if o["status"] == "completed")
     await cb.message.edit_text(
         f"📊 <b>To'liq statistika</b>\n\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
         f"👥 Foydalanuvchilar: <b>{len(d['users'])}</b>\n"
         f"📋 Jami: <b>{len(d['orders'])}</b>\n"
         f"✅ Bajarilgan: <b>{len([o for o in d['orders'] if o['status']=='completed'])}</b>\n"
-        f"❌ Xato: <b>{len([o for o in d['orders'] if o['status']=='failed'])}</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>\n"
+        f"❌ Xato: <b>{len([o for o in d['orders'] if o['status']=='failed'])}</b>\n\n"
         f"📅 Bugun: <b>{len(t_ord)}</b> ta\n"
         f"💰 Bugungi daromad: <b>{fmt(t_rev)} so'm</b>\n"
-        f"💰 Jami daromad: <b>{fmt(total_rev)} so'm</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━</code>",
+        f"💰 Jami daromad: <b>{fmt(total_rev)} so'm</b>",
         parse_mode="HTML", reply_markup=back_kb()
     )
 
 @dp.callback_query(F.data == "adm_users")
 async def cb_users(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id): return
-    d = db()
-    total  = len(d["users"])
-    banned = len([u for u in d["users"].values() if u.get("banned")])
+    d = db(); total = len(d["users"]); banned = len([u for u in d["users"].values() if u.get("banned")])
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚫 Bloklash", callback_data="adm_ban"),
-         InlineKeyboardButton(text="✅ Ochish", callback_data="adm_unban")],
+         InlineKeyboardButton(text="✅ Ochish",   callback_data="adm_unban")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
-    await cb.message.edit_text(
-        f"👥 <b>Foydalanuvchilar</b>\n\nJami: <b>{total}</b>\nBanlangan: <b>{banned}</b>",
-        parse_mode="HTML", reply_markup=kb
-    )
+    await cb.message.edit_text(f"👥 <b>Foydalanuvchilar</b>\n\nJami: <b>{total}</b>\nBanlangan: <b>{banned}</b>",
+                               parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data.in_({"adm_ban", "adm_unban"}))
 async def cb_ban(cb: types.CallbackQuery, state: FSMContext):
-    action = "bloklash" if cb.data == "adm_ban" else "ochish"
-    await cb.message.edit_text(f"ID kiriting ({action}):")
-    await state.update_data(ban_action=cb.data)
-    await state.set_state(Admin.ban_id)
+    await cb.message.edit_text(f"ID kiriting ({'bloklash' if cb.data=='adm_ban' else 'ochish'}):")
+    await state.update_data(ban_action=cb.data); await state.set_state(A.ban_id)
 
-@dp.message(Admin.ban_id)
+@dp.message(A.ban_id)
 async def enter_ban(msg: types.Message, state: FSMContext):
     try:
         bid = str(int(msg.text.strip()))
         if bid == str(SUPER_ADMIN_ID):
-            await msg.answer("❌ Asosiy adminni o'zgartirish mumkin emas!")
-            await state.clear(); return
+            await msg.answer("❌ Asosiy adminni o'zgartirish mumkin emas!"); await state.clear(); return
         data = await state.get_data(); d = db()
         if bid in d["users"]:
-            d["users"][bid]["banned"] = data.get("ban_action") == "adm_ban"
-            sdb(d)
-            act = "Bloklandi 🚫" if data.get("ban_action") == "adm_ban" else "Ochildi ✅"
-            await msg.answer(f"{act}: <code>{bid}</code>", parse_mode="HTML")
-        else:
-            await msg.answer("❌ Foydalanuvchi topilmadi!")
-        await state.clear()
-        await cmd_admin(msg, state)
-    except:
-        await msg.answer("❌ Noto'g'ri ID!")
+            d["users"][bid]["banned"] = data.get("ban_action") == "adm_ban"; sdb(d)
+            await msg.answer(f"{'Bloklandi 🚫' if data.get('ban_action')=='adm_ban' else 'Ochildi ✅'}: <code>{bid}</code>", parse_mode="HTML")
+        else: await msg.answer("❌ Foydalanuvchi topilmadi!")
+        await state.clear(); await cmd_admin(msg, state)
+    except: await msg.answer("❌ Noto'g'ri ID!")
 
 @dp.callback_query(F.data == "adm_orders")
 async def cb_orders(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id): return
     d = db(); orders = d["orders"][-8:]
-    if not orders:
-        await cb.answer("Buyurtmalar yo'q!", show_alert=True); return
+    if not orders: await cb.answer("Buyurtmalar yo'q!", show_alert=True); return
     st = {"completed": "✅", "failed": "❌", "processing": "⏳"}
-    text = "📋 <b>So'nggi buyurtmalar:</b>\n<code>━━━━━━━━━━━━━━━━</code>\n\n"
+    text = "📋 <b>So'nggi buyurtmalar:</b>\n<code>━━━━━━━━━━━━━━━━━━</code>\n\n"
     for o in reversed(orders):
-        svc = {"premium": f"P{o.get('months',3)}oy", "stars": f"{fmt(o.get('stars',0))}⭐", "gifts": "🎁", "nft": "NFT"}.get(o["service"], o["service"])
+        svc = {"premium": f"P{o.get('months',3)}oy", "stars": f"{fmt(o.get('stars',0))}⭐", "gifts": "🎁Gift", "nft": "🖼NFT"}.get(o["service"], o["service"])
         text += f"{st.get(o['status'],'❓')} <b>#{o['id']}</b> @{o.get('username','?')} — {svc} — {fmt(o['price'])} so'm\n"
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb())
 
@@ -1422,43 +1264,35 @@ async def cb_orders(cb: types.CallbackQuery):
 async def cb_broadcast(cb: types.CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await cb.message.edit_text("📢 <b>Xabar yozing:</b>", parse_mode="HTML")
-    await state.set_state(Admin.broadcast)
+    await state.set_state(A.broadcast)
 
-@dp.message(Admin.broadcast)
+@dp.message(A.broadcast)
 async def enter_broadcast(msg: types.Message, state: FSMContext):
     d = db(); sent = failed = 0
     prog = await msg.answer(f"⏳ Yuborilmoqda... 0/{len(d['users'])}")
     for i, uid in enumerate(d["users"]):
-        try:
-            await bot.send_message(int(uid), f"📢 <b>Xabar:</b>\n\n{msg.text}", parse_mode="HTML")
-            sent += 1
-        except:
-            failed += 1
+        try: await bot.send_message(int(uid), f"📢 <b>Xabar:</b>\n\n{msg.text}", parse_mode="HTML"); sent += 1
+        except: failed += 1
         if i % 20 == 0:
             try: await prog.edit_text(f"⏳ {i}/{len(d['users'])}")
             except: pass
         await asyncio.sleep(0.05)
-    await prog.edit_text(f"✅ Yuborildi! ✅{sent} ❌{failed}", parse_mode="HTML")
-    await state.clear()
-    await cmd_admin(msg, state)
+    await prog.edit_text(f"✅ Yuborildi! ✅{sent} ❌{failed}")
+    await state.clear(); await cmd_admin(msg, state)
 
 @dp.callback_query(F.data == "adm_settings")
 async def cb_settings(cb: types.CallbackQuery):
     if not is_super(cb.from_user.id): return
     d = db(); s = d["settings"]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📈 Foiz: {s['markup']}%", callback_data="adm_set_markup")],
-        [InlineKeyboardButton(text=f"⭐ Min Stars: {s['min_stars']}", callback_data="adm_set_minstars")],
-        [InlineKeyboardButton(text=f"⏰ Narx qulfi: {s.get('order_timeout_min', 15)} daqiqa", callback_data="adm_set_timeout")],
+        [InlineKeyboardButton(text=f"📈 Foiz: {s['markup']}%",         callback_data="adm_set_markup")],
+        [InlineKeyboardButton(text=f"⭐ Min Stars: {s['min_stars']}",   callback_data="adm_set_minstars")],
+        [InlineKeyboardButton(text=f"🔒 Narx qulfi: {s.get('price_lock_min',15)} daq", callback_data="adm_set_lock")],
         [InlineKeyboardButton(text=f"👥 Referral: {'✅' if s.get('referral_active') else '❌'}", callback_data="adm_toggle_ref")],
         [InlineKeyboardButton(text=f"🎁 Promo: {'✅' if s.get('promo_active') else '❌'}", callback_data="adm_toggle_promo")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
-    await cb.message.edit_text(
-        f"⚙️ <b>Bot sozlamalari</b>\n\n"
-        f"💎 1 TON = {fmt(PRICE_CACHE.get('ton_uzs', 0))} so'm",
-        parse_mode="HTML", reply_markup=kb
-    )
+    await cb.message.edit_text("⚙️ <b>Bot sozlamalari</b>", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_toggle_bot")
 async def toggle_bot(cb: types.CallbackQuery):
@@ -1484,15 +1318,14 @@ async def toggle_promo(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "adm_set_markup")
 async def set_markup(cb: types.CallbackQuery, state: FSMContext):
     if not is_super(cb.from_user.id): return
-    await cb.message.edit_text("📈 Yangi foizni kiriting (0-200):")
-    await state.set_state(Admin.markup)
+    await cb.message.edit_text("📈 Yangi foizni kiriting (0-200):\n\n<i>Masalan: 20</i>", parse_mode="HTML")
+    await state.set_state(A.markup)
 
-@dp.message(Admin.markup)
+@dp.message(A.markup)
 async def enter_markup(msg: types.Message, state: FSMContext):
     try:
         v = int(msg.text)
-        if v < 0 or v > 200:
-            await msg.answer("❌ 0 dan 200 gacha!"); return
+        if v < 0 or v > 200: await msg.answer("❌ 0-200 orasida!"); return
         d = db(); d["settings"]["markup"] = v; sdb(d)
         await msg.answer(f"✅ Foiz: <b>{v}%</b>", parse_mode="HTML")
         await state.clear(); await cmd_admin(msg, state)
@@ -1501,25 +1334,34 @@ async def enter_markup(msg: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_set_minstars")
 async def set_minstars(cb: types.CallbackQuery, state: FSMContext):
     if not is_super(cb.from_user.id): return
-    await cb.message.edit_text("⭐ Minimum Stars kiriting (min: 50):")
-    await state.set_state(Admin.min_stars)
+    await cb.message.edit_text("⭐ Minimum Stars (min: 50):")
+    await state.set_state(A.min_stars)
 
-@dp.message(Admin.min_stars)
+@dp.message(A.min_stars)
 async def enter_minstars(msg: types.Message, state: FSMContext):
     try:
         v = int(msg.text)
-        if v < 50:
-            await msg.answer("❌ Minimum 50!"); return
+        if v < 50: await msg.answer("❌ Minimum 50!"); return
         d = db(); d["settings"]["min_stars"] = v; sdb(d)
         await msg.answer(f"✅ Min Stars: <b>{v}</b>", parse_mode="HTML")
         await state.clear(); await cmd_admin(msg, state)
     except: await msg.answer("❌ Faqat raqam!")
 
-@dp.callback_query(F.data == "adm_set_timeout")
-async def set_timeout(cb: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "adm_set_lock")
+async def set_lock(cb: types.CallbackQuery, state: FSMContext):
     if not is_super(cb.from_user.id): return
-    await cb.message.edit_text("⏰ Narx qulfi muddati (daqiqada, 5-60):")
-    await state.set_state(Admin.ref_bonus)  # reuse state
+    await cb.message.edit_text("🔒 Narx qulfi muddati (daqiqada, 5-60):")
+    await state.set_state(A.lock_min)
+
+@dp.message(A.lock_min)
+async def enter_lock(msg: types.Message, state: FSMContext):
+    try:
+        v = int(msg.text)
+        if v < 5 or v > 60: await msg.answer("❌ 5-60 orasida!"); return
+        d = db(); d["settings"]["price_lock_min"] = v; sdb(d)
+        await msg.answer(f"✅ Narx qulfi: <b>{v} daqiqa</b>", parse_mode="HTML")
+        await state.clear(); await cmd_admin(msg, state)
+    except: await msg.answer("❌ Faqat raqam!")
 
 @dp.callback_query(F.data == "adm_cards")
 async def cb_cards(cb: types.CallbackQuery):
@@ -1527,18 +1369,17 @@ async def cb_cards(cb: types.CallbackQuery):
     d = db(); cards = d["settings"]["cards"]
     ct = "\n".join([f"• <code>{c}</code>" for c in cards]) if cards else "Kartalar yo'q"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Karta qo'shish", callback_data="adm_add_card")],
-        [InlineKeyboardButton(text="🗑 Hammasini o'chirish", callback_data="adm_clear_cards")],
+        [InlineKeyboardButton(text="➕ Qo'shish",  callback_data="adm_add_card"),
+         InlineKeyboardButton(text="🗑 Tozalash", callback_data="adm_clear_cards")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
     await cb.message.edit_text(f"💳 <b>Kartalar:</b>\n\n{ct}", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_add_card")
 async def add_card(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("💳 Karta raqamini kiriting:")
-    await state.set_state(Admin.card)
+    await cb.message.edit_text("💳 Karta raqamini kiriting:"); await state.set_state(A.card)
 
-@dp.message(Admin.card)
+@dp.message(A.card)
 async def enter_card(msg: types.Message, state: FSMContext):
     d = db(); d["settings"]["cards"].append(msg.text.strip()); sdb(d)
     await msg.answer(f"✅ Karta: <code>{msg.text.strip()}</code>", parse_mode="HTML")
@@ -1556,21 +1397,17 @@ async def cb_channels(cb: types.CallbackQuery):
     ct = "\n".join([f"• {c}" for c in chs]) if chs else "Kanallar yo'q"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="adm_add_ch")],
-        [InlineKeyboardButton(text="📝 Logs kanali", callback_data="adm_set_logs")],
-        [InlineKeyboardButton(text="🗑 Tozalash", callback_data="adm_clear_ch")],
-        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
+        [InlineKeyboardButton(text="📝 Logs kanali",    callback_data="adm_set_logs")],
+        [InlineKeyboardButton(text="🗑 Tozalash",        callback_data="adm_clear_ch")],
+        [InlineKeyboardButton(text="🔙 Orqaga",         callback_data="adm_main")],
     ])
-    await cb.message.edit_text(
-        f"📢 <b>Kanallar:</b>\n{ct}\n\n📝 <b>Logs:</b> {logs}",
-        parse_mode="HTML", reply_markup=kb
-    )
+    await cb.message.edit_text(f"📢 <b>Kanallar:</b>\n{ct}\n\n📝 <b>Logs:</b> {logs}", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_add_ch")
 async def add_ch(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("📢 Kanal username (@channel):")
-    await state.set_state(Admin.channel)
+    await cb.message.edit_text("📢 Kanal username (@channel):"); await state.set_state(A.channel)
 
-@dp.message(Admin.channel)
+@dp.message(A.channel)
 async def enter_channel(msg: types.Message, state: FSMContext):
     d = db(); d["settings"]["required_channels"].append(msg.text.strip()); sdb(d)
     await msg.answer(f"✅ Kanal: {msg.text.strip()}")
@@ -1583,10 +1420,9 @@ async def clear_ch(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_set_logs")
 async def set_logs(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("📝 Logs kanal (@logs):")
-    await state.set_state(Admin.logs)
+    await cb.message.edit_text("📝 Logs kanal (@logs):"); await state.set_state(A.logs)
 
-@dp.message(Admin.logs)
+@dp.message(A.logs)
 async def enter_logs(msg: types.Message, state: FSMContext):
     d = db(); d["settings"]["logs_channel"] = msg.text.strip(); sdb(d)
     await msg.answer(f"✅ Logs: {msg.text.strip()}")
@@ -1598,7 +1434,7 @@ async def cb_admins(cb: types.CallbackQuery):
     d = db(); admins = d.get("admins", {})
     at = "\n".join([f"• <code>{a}</code>" for a in admins.keys()]) if admins else "Adminlar yo'q"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Qo'shish", callback_data="adm_add_admin"),
+        [InlineKeyboardButton(text="➕ Qo'shish",  callback_data="adm_add_admin"),
          InlineKeyboardButton(text="➖ O'chirish", callback_data="adm_del_admin")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
@@ -1606,28 +1442,22 @@ async def cb_admins(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data.in_({"adm_add_admin", "adm_del_admin"}))
 async def manage_admin(cb: types.CallbackQuery, state: FSMContext):
-    action = "qo'shish" if cb.data == "adm_add_admin" else "o'chirish"
-    await cb.message.edit_text(f"👑 Admin ID ({action}):")
-    await state.update_data(admin_action=cb.data)
-    await state.set_state(Admin.admin_id)
+    await cb.message.edit_text(f"👑 Admin ID ({'qo\'shish' if cb.data=='adm_add_admin' else 'o\'chirish'}):")
+    await state.update_data(admin_action=cb.data); await state.set_state(A.admin_id)
 
-@dp.message(Admin.admin_id)
+@dp.message(A.admin_id)
 async def enter_admin(msg: types.Message, state: FSMContext):
     try:
         aid = int(msg.text.strip())
-        if aid == SUPER_ADMIN_ID:
-            await msg.answer("❌ Asosiy adminni o'zgartirish mumkin emas!")
-            await state.clear(); return
+        if aid == SUPER_ADMIN_ID: await msg.answer("❌ Asosiy adminni o'zgartirish mumkin emas!"); await state.clear(); return
         data = await state.get_data(); d = db()
         if data.get("admin_action") == "adm_add_admin":
             d["admins"][str(aid)] = {"added": datetime.now().isoformat()}; sdb(d)
             await msg.answer(f"✅ Admin: <code>{aid}</code>", parse_mode="HTML")
         else:
             if str(aid) in d["admins"]:
-                del d["admins"][str(aid)]; sdb(d)
-                await msg.answer(f"✅ O'chirildi: {aid}")
-            else:
-                await msg.answer("❌ Admin topilmadi!")
+                del d["admins"][str(aid)]; sdb(d); await msg.answer(f"✅ O'chirildi: {aid}")
+            else: await msg.answer("❌ Admin topilmadi!")
         await state.clear(); await cmd_admin(msg, state)
     except: await msg.answer("❌ Noto'g'ri ID!")
 
@@ -1637,52 +1467,38 @@ async def cb_promos(cb: types.CallbackQuery):
     d = db(); promos = d.get("promo_codes", {})
     pt = "\n".join([f"• <code>{k}</code> — {v['discount']}% ({v.get('used',0)}/{v.get('limit','∞')})" for k, v in promos.items()]) if promos else "Yo'q"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Yaratish", callback_data="adm_new_promo"),
-         InlineKeyboardButton(text="🗑 Tozalash", callback_data="adm_clear_promos")],
+        [InlineKeyboardButton(text="➕ Yaratish",  callback_data="adm_new_promo"),
+         InlineKeyboardButton(text="🗑 Tozalash",  callback_data="adm_clear_promos")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
     await cb.message.edit_text(f"🎁 <b>Promo kodlar:</b>\n\n{pt}", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_new_promo")
 async def new_promo(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("🎁 Promo kod nomi (masalan: SALE20):")
-    await state.set_state(Admin.promo_code)
+    await cb.message.edit_text("🎁 Promo kod nomi (masalan: SALE20):"); await state.set_state(A.promo_code)
 
-@dp.message(Admin.promo_code)
+@dp.message(A.promo_code)
 async def enter_promo_code(msg: types.Message, state: FSMContext):
     await state.update_data(promo_code=msg.text.strip().upper())
-    await msg.answer("📈 Chegirma foizi (1-90):")
-    await state.set_state(Admin.promo_discount)
+    await msg.answer("📈 Chegirma foizi (1-90):"); await state.set_state(A.promo_disc)
 
-@dp.message(Admin.promo_discount)
-async def enter_promo_discount(msg: types.Message, state: FSMContext):
+@dp.message(A.promo_disc)
+async def enter_promo_disc(msg: types.Message, state: FSMContext):
     try:
         v = int(msg.text)
-        if v < 1 or v > 90:
-            await msg.answer("❌ 1 dan 90 gacha!"); return
-        await state.update_data(promo_discount=v)
-        await msg.answer("🔢 Limit (0 = cheksiz):")
-        await state.set_state(Admin.promo_limit)
+        if v < 1 or v > 90: await msg.answer("❌ 1-90 orasida!"); return
+        await state.update_data(promo_disc=v)
+        await msg.answer("🔢 Limit (0 = cheksiz):"); await state.set_state(A.promo_limit)
     except: await msg.answer("❌ Faqat raqam!")
 
-@dp.message(Admin.promo_limit)
+@dp.message(A.promo_limit)
 async def enter_promo_limit(msg: types.Message, state: FSMContext):
     try:
         limit = int(msg.text); data = await state.get_data(); d = db()
         code = data["promo_code"]
-        d["promo_codes"][code] = {
-            "discount": data["promo_discount"],
-            "limit": limit if limit > 0 else None,
-            "used": 0, "created_at": datetime.now().isoformat()
-        }
+        d["promo_codes"][code] = {"discount": data["promo_disc"], "limit": limit if limit > 0 else None, "used": 0, "created_at": datetime.now().isoformat()}
         sdb(d)
-        await msg.answer(
-            f"✅ <b>Promo yaratildi!</b>\n\n"
-            f"🎁 <code>{code}</code>\n"
-            f"📈 {data['promo_discount']}%\n"
-            f"🔢 {limit if limit > 0 else 'Cheksiz'}",
-            parse_mode="HTML"
-        )
+        await msg.answer(f"✅ <b>Promo yaratildi!</b>\n\n🎁 <code>{code}</code>\n📈 {data['promo_disc']}%\n🔢 {limit if limit > 0 else 'Cheksiz'}", parse_mode="HTML")
         await state.clear(); await cmd_admin(msg, state)
     except: await msg.answer("❌ Faqat raqam!")
 
@@ -1692,50 +1508,37 @@ async def clear_promos(cb: types.CallbackQuery):
     await cb.answer("✅ Tozalandi!"); await cb_promos(cb)
 
 @dp.callback_query(F.data == "adm_referral")
-async def cb_referral_admin(cb: types.CallbackQuery):
+async def cb_ref_admin(cb: types.CallbackQuery):
     if not is_super(cb.from_user.id): return
     d = db(); s = d["settings"]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"👥 {'✅ Yoqilgan' if s.get('referral_active') else '❌ O\'chirilgan'}",
-            callback_data="adm_toggle_ref"
-        )],
-        [InlineKeyboardButton(
-            text=f"💰 Bonus: {fmt(s.get('referral_bonus', 5000))} so'm",
-            callback_data="adm_set_ref_bonus"
-        )],
+        [InlineKeyboardButton(text=f"👥 {'✅ Yoqilgan' if s.get('referral_active') else '❌ O\'chirilgan'}", callback_data="adm_toggle_ref")],
+        [InlineKeyboardButton(text=f"💰 Bonus: {fmt(s.get('referral_bonus',5000))} so'm", callback_data="adm_set_ref_bonus")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm_main")],
     ])
     await cb.message.edit_text("👥 <b>Referral tizimi</b>", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_set_ref_bonus")
 async def set_ref_bonus(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("💰 Referral bonus (so'mda):")
-    await state.set_state(Admin.ref_bonus)
+    await cb.message.edit_text("💰 Referral bonus (so'mda):"); await state.set_state(A.ref_bonus)
 
-@dp.message(Admin.ref_bonus)
+@dp.message(A.ref_bonus)
 async def enter_ref_bonus(msg: types.Message, state: FSMContext):
     try:
-        v = int(msg.text)
-        d = db(); d["settings"]["referral_bonus"] = v; sdb(d)
+        v = int(msg.text); d = db(); d["settings"]["referral_bonus"] = v; sdb(d)
         await msg.answer(f"✅ Bonus: <b>{fmt(v)} so'm</b>", parse_mode="HTML")
         await state.clear(); await cmd_admin(msg, state)
     except: await msg.answer("❌ Faqat raqam!")
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 # MAIN
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════
 async def main():
     log.info("🚀 U-Gift Bot ishga tushmoqda...")
-
-    # Narxlarni oldindan yuklash
-    log.info("📊 Narxlar yuklanmoqda...")
-    await update_prices(force=True)
-    log.info(f"✅ 1 TON = {fmt(PRICE_CACHE['ton_uzs'])} so'm")
-
-    # Narx yangilash loop ni background da ishga tushirish
-    asyncio.create_task(price_updater_loop())
-
+    log.info("📊 Fragment va kurs ma'lumotlari yuklanmoqda...")
+    await update_all_prices(force=True)
+    log.info(f"✅ 1 TON = {fmt(PRICES['ton_uzs'])} so'm | Premium 3oy = {PRICES['premium'].get(3,0)} TON")
+    asyncio.create_task(price_loop())
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
